@@ -1,0 +1,31 @@
+{
+  "name": "alastudie-local-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --env-file-if-exists=.env --import tsx --watch src/server.ts",
+    "start": "node --env-file-if-exists=.env --import tsx src/server.ts",
+    "test": "node --test",
+    "test:integration": "node --test test/mvp.integration.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "seed:demo": "node scripts/seed-demo.mjs",
+    "db:initialize": "initdb -D .local/postgres",
+    "db:start": "pg_ctl -D .local/postgres -l .local/postgres.log -o \"-p 5433 -h 127.0.0.1\" start",
+    "db:stop": "pg_ctl -D .local/postgres stop"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "pg": "^8.16.3",
+    "socket.io": "^4.8.1",
+    "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.15.30",
+    "@types/pg": "^8.15.5",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
