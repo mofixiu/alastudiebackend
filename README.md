@@ -1,6 +1,6 @@
 # aLaStudie local API
 
-This service runs entirely on the local machine. It uses PostgreSQL for durable data, Socket.IO for room events, and a development mailbox stored in PostgreSQL for verification and reset emails. It does not connect to a cloud provider.
+This service runs locally with PostgreSQL, Socket.IO, and a development mailbox stored in PostgreSQL. It does not contact a cloud provider unless an operator deliberately enables the optional Gemini study tools described below.
 
 ## Start locally
 
@@ -23,6 +23,21 @@ Public room shares open a small room preview page at `/share/rooms/<room-id>`. F
 
 ## Tests
 
-Run `npm run typecheck` for the backend type check. The integration suite uses a disposable PostgreSQL database and starts a separate local API process. Create a test database whose name contains `test`, then run `TEST_DATABASE_URL=postgres://.../alastudie_test npm run test:integration`. The suite refuses database names without `test` in them. It exercises account verification/recovery and username/email sign-in, room access and discovery filters, recurring calendar occurrences/RSVPs/reminders/attendance/cancellations, templates and co-host permissions, per-member tasks, live presence and shared sessions, chat and DMs, private statistics, reports, and moderation. Flutter tests cover offline sync, response models, navigation, theme, and CSV export.
+Run `npm run typecheck` for the backend type check. The integration suite uses a disposable PostgreSQL database and starts a separate local API process. Create a test database whose name contains `test`, then run `TEST_DATABASE_URL=postgres://.../alastudie_test npm run test:integration`. The suite refuses database names without `test` in them. It exercises account verification/recovery and username/email sign-in, room access and discovery filters, recurring calendar occurrences/RSVPs/reminders/attendance/cancellations, templates and co-host permissions, private planner ownership/carry-forward, opt-in matching, friend requests, achievements/leaderboard privacy, room files/notes/whiteboard sync, offline-summary idempotency, school-email verification/invites, Gemini context boundaries, quota cutoffs, provider errors, and index cleanup. Gemini requests in tests terminate at a local mock and never contact Google. Flutter tests cover offline sync, response models, navigation, theme, and CSV export.
 
 For an Android emulator, set Flutter's API base URL to `http://10.0.2.2:4000`. For an iOS simulator, use `http://127.0.0.1:4000`.
+# Gemini study tools
+
+AI routes fail closed unless the backend has a server-side `GEMINI_API_KEY`,
+confirmed Gemini-eligible credit, a configured Google-side spend cap, and the
+budget and rate values listed in `.env.example`. The mobile app never receives
+the API key. Each request is user-initiated, estimates and reserves cost before
+calling Gemini, and records usage without saving prompts. Semantic search sends
+only files the user selected from a room they can access; its private Google
+File Search index remains until removed. Deletions are retried from a durable
+cleanup queue after temporary provider/network failures.
+
+The integration suite uses a local mock Gemini endpoint and makes no Google
+requests. Keep AI disabled for development until the credit balance and Google
+Cloud spend cap have been confirmed; the app's cutoff is a protective estimate,
+not a cent-precise substitute for Google's billing limit.

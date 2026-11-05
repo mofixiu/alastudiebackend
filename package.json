@@ -6,8 +6,8 @@
   "scripts": {
     "dev": "node --env-file-if-exists=.env --import tsx --watch src/server.ts",
     "start": "node --env-file-if-exists=.env --import tsx src/server.ts",
-    "test": "node --test",
-    "test:integration": "node --test test/mvp.integration.test.mjs",
+    "test": "node --import tsx --test",
+    "test:integration": "node --import tsx --test test/mvp.integration.test.mjs",
     "typecheck": "tsc --noEmit",
     "seed:demo": "node scripts/seed-demo.mjs",
     "db:initialize": "initdb -D .local/postgres",

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { createServer as createHttpServer } from 'node:http';
 import { createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
@@ -21,6 +22,42 @@ test('local API covers the agreed aLaStudie MVP flows', { skip: skippedReason },
   const suffix = `${Date.now()}_${Math.floor(Math.random() * 10000)}`;
   const adminEmail = `staff_${suffix}@example.test`;
   const baseUrl = `http://127.0.0.1:${port}`;
+  const geminiRequests = [];
+  let mockStoreSequence = 0;
+  const geminiMock = createHttpServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const raw = Buffer.concat(chunks).toString('utf8');
+    let payload = {};
+    try { payload = raw.startsWith('{') ? JSON.parse(raw) : {}; } catch {}
+    geminiRequests.push({ method: req.method, url: req.url, payload, raw });
+    res.setHeader('Content-Type', 'application/json');
+    if (req.url?.includes('uploadToFileSearchStore') && req.headers['x-goog-upload-command'] === 'start') {
+      res.setHeader('x-goog-upload-url', `http://127.0.0.1:${geminiMock.address().port}/upload-finalize`);
+      res.end('{}');
+    } else if (req.url === '/upload-finalize') {
+      res.end(JSON.stringify({ done: true, response: { documentName: 'fileSearchStores/mock/documents/demo' } }));
+    } else if (req.url?.includes('/fileSearchStores') && req.method === 'POST') {
+      mockStoreSequence += 1;
+      res.end(JSON.stringify({ name: `fileSearchStores/test-private-store-${mockStoreSequence}` }));
+    } else if (req.url?.includes(':generateContent')) {
+      const prompt = payload.contents?.[0]?.parts?.[0]?.text ?? '';
+      if (prompt.includes('force-provider-error')) {
+        res.statusCode = 503;
+        res.end(JSON.stringify({ error: { message: 'Mock provider failure' } }));
+      } else {
+        const answer = prompt.includes('Return only valid JSON with shape')
+          ? JSON.stringify({ blocks: [{ title: 'Mock revision', subject: 'Biology', startsAt: new Date(Date.now() + 86_400_000).toISOString(), endsAt: new Date(Date.now() + 87_000_000).toISOString() }] })
+          : 'Mocked study response.';
+        res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: answer }] }, groundingMetadata: { groundingChunks: [{ retrievedContext: { title: 'Selected file', uri: 'fileSearchStores/mock/documents/demo' } }] } }], usageMetadata: { promptTokenCount: 12, candidatesTokenCount: 8 } }));
+      }
+    } else {
+      res.end('{}');
+    }
+  });
+  geminiMock.listen(0, '127.0.0.1');
+  await once(geminiMock, 'listening');
+  t.after(() => geminiMock.close());
   const apiProcess = spawn(process.execPath, ['--import', 'tsx', 'src/server.ts'], {
     cwd: new URL('..', import.meta.url),
     env: {
@@ -30,6 +67,15 @@ test('local API covers the agreed aLaStudie MVP flows', { skip: skippedReason },
       NODE_ENV: 'test',
       LOCAL_MAILBOX_ENABLED: 'true',
       ADMIN_EMAILS: adminEmail,
+      GEMINI_API_KEY: 'integration-test-only',
+      GEMINI_API_BASE_URL: `http://127.0.0.1:${geminiMock.address().port}`,
+      GEMINI_CREDITS_CONFIRMED: 'true',
+      GEMINI_SPEND_CAP_CONFIGURED: 'true',
+      GEMINI_BUDGET_USD: '40',
+      GEMINI_BUDGET_RESERVE_USD: '2',
+      GEMINI_INPUT_USD_PER_MILLION: '0.1',
+      GEMINI_OUTPUT_USD_PER_MILLION: '0.4',
+      GEMINI_EMBEDDING_USD_PER_MILLION: '0',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -96,6 +142,9 @@ test('local API covers the agreed aLaStudie MVP flows', { skip: skippedReason },
   };
 
   expectStatus(await call(null, 'GET', '/health'), 200);
+  const plannerOptions = await fetch(`${baseUrl}/planner/goal`, { method: 'OPTIONS' });
+  assert.equal(plannerOptions.status, 204);
+  assert.match(plannerOptions.headers.get('access-control-allow-methods'), /PUT/);
   expectStatus(await call(null, 'GET', '/me'), 401);
   expectStatus(await call(null, 'POST', '/auth/register', {
     email: `short_${suffix}@example.test`, username: `short_${suffix}`,
@@ -427,6 +476,136 @@ test('local API covers the agreed aLaStudie MVP flows', { skip: skippedReason },
   assert.equal(stats.days.some((day) => day.focusedSeconds === 1440), true);
   const history = expectStatus(await call(host, 'GET', '/sessions/history'), 200);
   assert.ok(history.sessions.length >= 3);
+
+  // Private weekly planning stays scoped to one account and counts manual completion.
+  const hostBlockStart = new Date(Date.now() + 24 * 60 * 60 * 1000);
+  const hostBlockEnd = new Date(hostBlockStart.getTime() + 60 * 60 * 1000);
+  const hostBlock = expectStatus(await call(host, 'POST', '/planner/blocks', {
+    title: 'HOST_PRIVATE_BLOCK', subject: 'Biology', startsAt: hostBlockStart.toISOString(), endsAt: hostBlockEnd.toISOString(), reminderEnabled: false,
+  }), 201).block;
+  const memberBlock = expectStatus(await call(member, 'POST', '/planner/blocks', {
+    title: 'MEMBER_SECRET_BLOCK', subject: 'Mathematics', startsAt: hostBlockStart.toISOString(), endsAt: hostBlockEnd.toISOString(), reminderEnabled: false,
+  }), 201).block;
+  expectStatus(await call(host, 'PUT', '/planner/goal', { sessionsPerWeek: 5 }), 200);
+  let hostPlan = expectStatus(await call(host, 'GET', `/planner/blocks?from=${encodeURIComponent(hostBlockStart.toISOString())}&to=${encodeURIComponent(new Date(hostBlockEnd.getTime() + 60_000).toISOString())}`), 200);
+  assert.equal(hostPlan.goal, 5);
+  assert.ok(hostPlan.blocks.some((block) => block.id === hostBlock.id));
+  assert.equal(hostPlan.blocks.some((block) => block.id === memberBlock.id), false);
+  expectStatus(await call(host, 'PATCH', `/planner/blocks/${hostBlock.id}`, { completed: true }), 200);
+  hostPlan = expectStatus(await call(host, 'GET', '/planner/blocks'), 200);
+  assert.ok(hostPlan.completedThisWeek >= 1);
+  const copied = expectStatus(await call(host, 'POST', '/planner/blocks/carry-forward', { copies: [{ blockId: hostBlock.id, startsAt: new Date(hostBlockStart.getTime() + 7 * 86_400_000).toISOString(), endsAt: new Date(hostBlockEnd.getTime() + 7 * 86_400_000).toISOString() }] }), 201);
+  assert.equal(copied.blocks.length, 1);
+
+  // Matching only returns opted-in people and omits school and exact windows.
+  for (const account of [host, member]) {
+    expectStatus(await call(account, 'PUT', '/matching/preferences', {
+      enabled: true, subjects: ['Computer science'], courses: ['CSC test'], availability: ['weekday_evening'],
+    }), 200);
+  }
+  const recommendations = expectStatus(await call(host, 'GET', '/recommendations'), 200);
+  const match = recommendations.people.find((person) => person.id === member.id);
+  assert.ok(match);
+  assert.equal('school' in match, false);
+  assert.equal('availability' in match, false);
+  assert.equal('email' in match, false);
+
+  // Friend requests are independent of DM requests, and accepted friends persist.
+  const friendRequest = expectStatus(await call(host, 'POST', '/friends/requests', { username: member.username }), 201).request;
+  const memberRequests = expectStatus(await call(member, 'GET', '/friends/requests'), 200).requests;
+  assert.ok(memberRequests.some((item) => item.id === friendRequest.id));
+  expectStatus(await call(member, 'PATCH', `/friends/requests/${friendRequest.id}`, { action: 'accept' }), 200);
+  assert.ok(expectStatus(await call(host, 'GET', '/friends'), 200).friends.some((item) => item.id === member.id));
+
+  // Room files, notes, and the optimistic-version whiteboard require membership.
+  const material = expectStatus(await call(host, 'POST', `/rooms/${publicRoom.id}/materials`, {
+    title: 'Shared lecture notes', fileName: 'lecture.txt', contentType: 'text/plain', dataBase64: Buffer.from('A private room document about photosynthesis.').toString('base64'),
+  }), 201).material;
+  assert.equal(expectStatus(await call(member, 'GET', `/rooms/${publicRoom.id}/materials`), 200).materials.some((item) => item.id === material.id), true);
+  expectStatus(await call(invitee, 'GET', `/rooms/${publicRoom.id}/materials`), 403);
+  const download = await fetch(`${baseUrl}/rooms/${publicRoom.id}/materials/${material.id}/download`, { headers: { Authorization: `Bearer ${member.token}` } });
+  assert.equal(download.status, 200);
+  assert.match(await download.text(), /photosynthesis/);
+  const note = expectStatus(await call(host, 'POST', `/rooms/${publicRoom.id}/notes`, { title: 'Shared outline', body: 'Chapter 4' }), 201).note;
+  expectStatus(await call(member, 'PATCH', `/rooms/${publicRoom.id}/notes/${note.id}`, { version: 1, title: 'Shared outline', body: 'Chapter 4 with examples' }), 200);
+  expectStatus(await call(host, 'PATCH', `/rooms/${publicRoom.id}/notes/${note.id}`, { version: 1, title: 'Stale edit', body: 'Should not overwrite' }), 409);
+  assert.equal(expectStatus(await call(member, 'GET', `/rooms/${publicRoom.id}/whiteboard`), 200).whiteboard.version, 0);
+  const boardBroadcast = memberSocket.waitForEvent('whiteboard:update', (event) => event.roomId === publicRoom.id);
+  const board = expectStatus(await call(host, 'PUT', `/rooms/${publicRoom.id}/whiteboard`, { version: 0, strokes: [{ color: '003F52', width: 0.006, points: [{ x: 0.1, y: 0.2 }, { x: 0.4, y: 0.5 }] }] }), 200).whiteboard;
+  assert.equal(board.version, 1);
+  assert.equal((await boardBroadcast).whiteboard.version, 1);
+  expectStatus(await call(member, 'PUT', `/rooms/${publicRoom.id}/whiteboard`, { version: 0, strokes: [] }), 409);
+  expectStatus(await call(invitee, 'GET', `/rooms/${publicRoom.id}/whiteboard`), 403);
+
+  // Nearby recovery summaries are private and idempotent; chat is never accepted here.
+  const offlineSummary = { clientSessionId: `nearby-${suffix}`, focusedSeconds: 1500, completedCycles: 1, endedAt: new Date().toISOString() };
+  expectStatus(await call(host, 'POST', '/offline/summaries', offlineSummary), 201);
+  expectStatus(await call(host, 'POST', '/offline/summaries', offlineSummary), 201);
+  const savedSummary = await db.query('SELECT COUNT(*)::int count FROM nearby_summaries WHERE user_id=$1 AND client_session_id=$2', [host.id, offlineSummary.clientSessionId]);
+  assert.equal(savedSummary.rows[0].count, 1);
+  assert.equal('messages' in offlineSummary, false);
+
+  // An optional school email is separate from the login email; invite fallback is labelled.
+  expectStatus(await call(admin, 'POST', '/admin/institutions', { name: 'Example Test University', domain: 'uni.example.test' }), 201);
+  const schoolEmail = `host-${suffix}@uni.example.test`;
+  expectStatus(await call(host, 'POST', '/communities/school-email/request', { email: schoolEmail }), 202);
+  expectStatus(await call(host, 'POST', '/communities/school-email/verify', { email: schoolEmail, code: await mailboxCode(schoolEmail, 'Verify') }), 200);
+  const hostCommunity = expectStatus(await call(host, 'GET', '/communities'), 200).communities[0];
+  expectStatus(await call(host, 'POST', `/communities/${hostCommunity.id}/invites`, { username: invitee.username }), 201);
+  const inviteeCommunity = expectStatus(await call(invitee, 'GET', '/communities'), 200).communities.find((item) => item.id === hostCommunity.id);
+  assert.ok(inviteeCommunity.invite_id);
+  expectStatus(await call(invitee, 'POST', `/communities/${hostCommunity.id}/join`), 201);
+  assert.equal(expectStatus(await call(invitee, 'GET', '/communities'), 200).communities.find((item) => item.id === hostCommunity.id).verification_method, 'member_invite');
+  expectStatus(await call(member, 'POST', '/communities/school-email/request', { email: `student@unsupported.example` }), 422);
+
+  // Weekly public rankings are a separate opt-in and only disclose chosen names and scores.
+  await db.query("INSERT INTO user_focus_activities(user_id,activity_key,source,focused_seconds,session_count,occurred_at) VALUES($1,$2,'timer',1500,4,NOW()),($3,$4,'timer',3000,8,NOW()) ON CONFLICT DO NOTHING", [host.id, `test-leader-${suffix}`, member.id, `test-opt-out-${suffix}`]);
+  expectStatus(await call(host, 'PUT', '/leaderboard/settings', { enabled: true, displayName: 'Study captain' }), 200);
+  expectStatus(await call(member, 'PUT', '/leaderboard/settings', { enabled: false, displayName: 'Hidden student' }), 200);
+  const leaderboard = expectStatus(await call(host, 'GET', '/leaderboard/weekly'), 200).entries;
+  assert.ok(leaderboard.some((entry) => entry.displayName === 'Study captain' && entry.weeklyScore >= 4));
+  assert.equal(leaderboard.some((entry) => JSON.stringify(entry).includes(member.username)), false);
+  assert.deepEqual(Object.keys(leaderboard[0]).sort(), ['displayName', 'rank', 'weeklyScore'].sort());
+
+  // All integration AI traffic terminates at a local mock provider, never Google.
+  assert.equal(expectStatus(await call(host, 'GET', '/ai/status'), 200).enabled, true);
+  expectStatus(await call(host, 'POST', '/ai/requests', { operation: 'semantic_search', prompt: 'Find the reaction summary', roomId: publicRoom.id, materialIds: [material.id], confirmGoogleProcessing: true }), 400);
+  const semantic = expectStatus(await call(host, 'POST', '/ai/requests', { operation: 'semantic_search', prompt: 'Find the reaction summary', roomId: publicRoom.id, materialIds: [material.id], confirmGoogleProcessing: true, confirmPersistentIndex: true }), 200);
+  assert.match(semantic.answer, /Mocked study response/);
+  const semanticCall = geminiRequests.findLast((item) => item.url?.includes(':generateContent'));
+  assert.ok(semanticCall.payload.tools[0].file_search.file_search_store_names.length > 0);
+  const clearedIndex = expectStatus(await call(host, 'DELETE', `/ai/material-index/${material.id}`), 200);
+  assert.equal(clearedIndex.cleanupPending, false);
+  assert.equal(geminiRequests.some((item) => item.method === 'DELETE' && item.url?.includes('fileSearchStores/test-private-store-')), true);
+  const cleanupMaterial = expectStatus(await call(host, 'POST', `/rooms/${publicRoom.id}/materials`, {
+    title: 'Index cleanup test', fileName: 'cleanup.txt', contentType: 'text/plain', dataBase64: Buffer.from('Remove the selected document index with its room file.').toString('base64'),
+  }), 201).material;
+  expectStatus(await call(host, 'POST', '/ai/requests', { operation: 'semantic_search', prompt: 'Find the cleanup note', roomId: publicRoom.id, materialIds: [cleanupMaterial.id], confirmGoogleProcessing: true, confirmPersistentIndex: true }), 200);
+  const [cleanupStore] = (await db.query('SELECT store_name FROM ai_file_search_stores WHERE user_id=$1 AND material_id=$2', [host.id, cleanupMaterial.id])).rows;
+  assert.ok(cleanupStore);
+  expectStatus(await call(host, 'DELETE', `/rooms/${publicRoom.id}/materials/${cleanupMaterial.id}`), 200);
+  const queuedCleanup = await db.query('SELECT 1 FROM ai_file_search_cleanup WHERE store_name=$1', [cleanupStore.store_name]);
+  assert.equal(queuedCleanup.rowCount, 1);
+  const ownPlan = expectStatus(await call(host, 'POST', '/ai/requests', { operation: 'assistant', prompt: 'Suggest a next step', includePlan: true, confirmGoogleProcessing: true }), 200);
+  assert.match(ownPlan.answer, /Mocked study response/);
+  const ownPlanCall = geminiRequests.findLast((item) => item.url?.includes(':generateContent'));
+  const sentPrompt = ownPlanCall.payload.contents[0].parts[0].text;
+  assert.match(sentPrompt, /HOST_PRIVATE_BLOCK/);
+  assert.doesNotMatch(sentPrompt, /MEMBER_SECRET_BLOCK/);
+  const planDraft = expectStatus(await call(host, 'POST', '/ai/requests', { operation: 'study_plan', prompt: 'Fit in biology review', confirmGoogleProcessing: true }), 200);
+  assert.equal(JSON.parse(planDraft.answer).blocks.length, 1);
+  expectStatus(await call(host, 'POST', '/ai/requests', { operation: 'assistant', prompt: 'force-provider-error', confirmGoogleProcessing: true }), 502);
+
+  // The local guard stops calls before the configured protected budget; this
+  // assertion is against the mock provider and never contacts Google.
+  await db.query(
+    "INSERT INTO ai_usage(user_id,request_id,operation,model,estimated_usd) VALUES($1,$2,'assistant','mock-model',38.5)",
+    [host.id, `budget-cutoff-${suffix}`],
+  );
+  const callsBeforeCutoff = geminiRequests.length;
+  expectStatus(await call(host, 'POST', '/ai/requests', { operation: 'assistant', prompt: 'must stop at the safety cutoff', confirmGoogleProcessing: true }), 429);
+  assert.equal(geminiRequests.length, callsBeforeCutoff);
+  await db.query('DELETE FROM ai_usage WHERE request_id=$1', [`budget-cutoff-${suffix}`]);
 
   // Blocking, report privacy, staff review actions, and notification ownership.
   expectStatus(await call(member, 'POST', `/users/${host.id}/block`, {}), 201);

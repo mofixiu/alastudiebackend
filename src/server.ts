@@ -6,6 +6,8 @@ import { fileURLToPath } from 'node:url';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { Pool, type QueryResultRow } from 'pg';
 import { Server as SocketServer, type Socket } from 'socket.io';
+import { registerRoadmapRoutes } from './roadmap_routes.js';
+import { registerAiRoutes } from './ai_routes.js';
 
 const port = Number(process.env.PORT ?? 4000);
 const pool = new Pool({ connectionString: process.env.DATABASE_URL ?? 'postgres://localhost:5433/alastudie' });
@@ -103,11 +105,11 @@ const issueEmailToken = async (userId: string, purpose: 'verify' | 'reset', emai
 };
 
 app.disable('x-powered-by');
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '12mb' }));
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Idempotency-Key');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -217,7 +219,7 @@ const setPresence = async (roomId: string, userId: string, status: Presence) => 
 };
 const openFocusInterval = async (sessionId: string, userId: string) => {
   await run('UPDATE session_participants SET last_focus_started_at=COALESCE(last_focus_started_at,NOW()) WHERE session_id=$1 AND user_id=$2', [sessionId, userId]);
-  await run('INSERT INTO focus_intervals(session_id,user_id) VALUES($1,$2) ON CONFLICT(session_id,user_id) WHERE ended_at IS NULL DO NOTHING', [sessionId, userId]);
+  await run('INSERT INTO focus_intervals(session_id,user_id,cycle) SELECT $1,$2,cycle FROM study_sessions WHERE id=$1 ON CONFLICT(session_id,user_id) WHERE ended_at IS NULL DO NOTHING', [sessionId, userId]);
 };
 const closeFocusInterval = async (sessionId: string, userId: string) => {
   const closed = await run('UPDATE focus_intervals SET ended_at=NOW() WHERE session_id=$1 AND user_id=$2 AND ended_at IS NULL RETURNING FLOOR(EXTRACT(EPOCH FROM (NOW()-started_at)))::int seconds', [sessionId, userId]);
@@ -534,7 +536,11 @@ app.post('/calendar/occurrences/:occurrenceId/attendance', authenticate, asyncRo
   if (Date.now() < start - 60 * 60_000 || Date.now() > start + 4 * 60 * 60_000) {
     throw new HttpError(409, 'Attendance opens one hour before the room and closes four hours after it starts.');
   }
-  await run('INSERT INTO occurrence_attendance(occurrence_id,user_id,marked_by) VALUES($1,$2,$3) ON CONFLICT(occurrence_id,user_id) DO NOTHING', [occurrenceId, targetId, me.id]);
+  const attendance = await run('INSERT INTO occurrence_attendance(occurrence_id,user_id,marked_by) VALUES($1,$2,$3) ON CONFLICT(occurrence_id,user_id) DO NOTHING RETURNING occurrence_id', [occurrenceId, targetId, me.id]);
+  if (attendance.rowCount) {
+    await run(`INSERT INTO user_focus_activities(user_id,activity_key,source,occurred_at)
+      VALUES($1,$2,'room_checkin',NOW()) ON CONFLICT(user_id,activity_key) DO NOTHING`, [targetId, `attendance:${occurrenceId}`]);
+  }
   res.json({ occurrenceId, userId: targetId, attended: true });
 }));
 
@@ -909,10 +915,19 @@ app.get('/stats', authenticate, asyncRoute(async (req, res) => {
          ) AS bucket(day)
          WHERE fi.user_id=$1
        )
-       SELECT to_char(day, 'YYYY-MM-DD') AS day,
-         FLOOR(SUM(EXTRACT(EPOCH FROM (interval_end-interval_start))))::int focused_seconds,
-         COUNT(DISTINCT session_id)::int sessions
-       FROM expanded WHERE interval_end>interval_start GROUP BY day ORDER BY day`, [me.id, timezone],
+       , activity_days AS (
+         SELECT (occurred_at AT TIME ZONE $2)::date AS day,
+           SUM(focused_seconds)::int focused_seconds,SUM(session_count)::int sessions
+         FROM user_focus_activities WHERE user_id=$1 AND source IN ('planner_block','room_checkin','nearby')
+         GROUP BY (occurred_at AT TIME ZONE $2)::date
+       ), combined AS (
+         SELECT day,FLOOR(SUM(EXTRACT(EPOCH FROM (interval_end-interval_start))))::int focused_seconds,
+           COUNT(DISTINCT session_id)::int sessions
+         FROM expanded WHERE interval_end>interval_start GROUP BY day
+         UNION ALL SELECT day,focused_seconds,sessions FROM activity_days
+       )
+       SELECT to_char(day, 'YYYY-MM-DD') AS day,SUM(focused_seconds)::int focused_seconds,SUM(sessions)::int sessions
+       FROM combined GROUP BY day ORDER BY day`, [me.id, timezone],
     ),
     run('SELECT (NOW() AT TIME ZONE $1)::date::text local_today', [timezone]),
   ]);
@@ -1144,6 +1159,9 @@ app.patch('/notifications/:id/read', authenticate, asyncRoute(async (req, res) =
   res.json({ read: true });
 }));
 
+registerRoadmapRoutes(app, pool, authenticate, io);
+registerAiRoutes(app, pool, authenticate);
+
 io.use(async (socket, next) => {
   try {
     const token = String(socket.handshake.auth.token ?? '');
@@ -1194,6 +1212,20 @@ const advanceSessions = async () => {
     if (left > 0) continue;
     if (session.phase === 'focus') {
       await closeFocusIntervals(session.id);
+      const completedFocus = await run(
+        `SELECT user_id,FLOOR(SUM(EXTRACT(EPOCH FROM (ended_at-started_at))))::int focused_seconds
+         FROM focus_intervals WHERE session_id=$1 AND cycle=$2 AND ended_at IS NOT NULL
+         GROUP BY user_id`, [session.id, session.cycle],
+      );
+      for (const participant of completedFocus.rows) {
+        const focusedSeconds = Number(participant.focused_seconds ?? 0);
+        if (focusedSeconds < Math.floor(Number(session.focus_seconds) * 0.8)) continue;
+        await run(
+          `INSERT INTO user_focus_activities(user_id,activity_key,source,focused_seconds,session_count)
+           VALUES($1,$2,'timer',$3,1) ON CONFLICT(user_id,activity_key) DO NOTHING`,
+          [participant.user_id, `roomtimer:${session.id}:${session.cycle}:${participant.user_id}`, focusedSeconds],
+        );
+      }
       await run("UPDATE study_sessions SET phase='break',phase_started_at=NOW(),remaining_seconds=$2 WHERE id=$1 AND status='running'", [session.id, session.break_seconds]);
     } else {
       const cycle = Number(session.cycle) + 1;
